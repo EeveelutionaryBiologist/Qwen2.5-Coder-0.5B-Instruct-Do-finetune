@@ -8,6 +8,7 @@ from pathlib import Path
 
 from huggingface_hub import snapshot_download
 
+
 REPO_ID = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
 MODEL_DIR = Path(__file__).resolve().parent.parent / "model"
 
