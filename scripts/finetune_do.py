@@ -13,12 +13,16 @@ finetune-plan.md §2, trained against Do's own prompt per §3:
   3. Fewer epochs -- 10 over 40k unverified pairs memorizes noise. Default 3,
      sweep 2-4.
 
-The prompt is imported from ../Do/do/prompt.py rather than copied, so the
-training prompt cannot drift from the inference prompt. PROMPT_VERSION is
-recorded alongside the checkpoint: a prompt change invalidates the fine-tune.
+Do's prompt is vendored at scripts/vendor/do_prompt.py, because the Do checkout
+is not guaranteed to exist on the training machine. To keep the training prompt
+from drifting from the inference prompt anyway, the vendored copy is byte-identical
+upstream and is checked against a reachable Do checkout before training; see
+scripts/vendor/PROVENANCE.md. PROMPT_VERSION is recorded alongside the checkpoint:
+a prompt change invalidates the fine-tune.
 """
 
 import argparse
+import hashlib
 import json
 import random
 import sys
@@ -27,7 +31,11 @@ from pathlib import Path
 from datasets import load_dataset
 from trl import SFTConfig, SFTTrainer
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "vendor"))
+import do_prompt as P  # noqa: E402  vendored copy of Do/do/prompt.py
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
+VENDORED_PROMPT = Path(__file__).resolve().parent / "vendor" / "do_prompt.py"
 DEFAULT_DO_REPO = REPO_ROOT.parent / "Do"
 
 # 8-bit optimizer states are what make the 1.5B run fit: standard AdamW needs
@@ -36,17 +44,36 @@ BNB_8BIT = "adamw_bnb_8bit"
 TORCH_FUSED = "adamw_torch_fused"
 
 
-def load_do_prompt(do_repo: Path):
-    """Import Do's prompt module. Imported, never copied -- see §3."""
-    if not (do_repo / "do" / "prompt.py").exists():
-        raise SystemExit(f"Do's prompt module not found under {do_repo} -- pass --do-repo.")
-    sys.path.insert(0, str(do_repo))
-    from do import prompt as prompt_mod  # noqa: E402
+def check_prompt_drift(do_repo: Path, allow_drift: bool) -> str:
+    """Compare the vendored prompt against a Do checkout, when one is reachable.
 
-    return prompt_mod
+    Absent on the training machine, which is the whole reason the prompt is
+    vendored -- so a missing checkout is fine. A *present but different* one is
+    not: it means the vendored copy is stale and the model would be trained
+    against a prompt Do no longer sends.
+    """
+    upstream = do_repo / "do" / "prompt.py"
+    if not upstream.exists():
+        return "unchecked (no Do checkout)"
+
+    def digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    if digest(upstream) == digest(VENDORED_PROMPT):
+        return "matches upstream"
+
+    message = (
+        f"vendored prompt is stale: {VENDORED_PROMPT} differs from {upstream}.\n"
+        f"Re-vendor with:  cp {upstream} {VENDORED_PROMPT}\n"
+        f"then update scripts/vendor/PROVENANCE.md."
+    )
+    if not allow_drift:
+        raise SystemExit(f"error: {message}")
+    print(f"warning: {message}", file=sys.stderr)
+    return "STALE (override)"
 
 
-def render_prompt(P, request: str, shell: str, os_name: str, few_shots: bool) -> str:
+def render_prompt(request: str, shell: str, os_name: str, few_shots: bool) -> str:
     """Do's ChatML prompt for one request, ending at the assistant turn.
 
     With few_shots=True this is exactly `P.build(...)`. With few_shots=False we
@@ -63,7 +90,7 @@ def render_prompt(P, request: str, shell: str, os_name: str, few_shots: bool) ->
     return P._turn("system", P.SYSTEM) + P._turn("user", user) + f"{P.IM_START}assistant\n"
 
 
-def build_formatter(P, args):
+def build_formatter(args):
     """Row -> {"prompt", "completion"}. The completion stays bare: TRL appends
     the tokenizer's eos_token (<|im_end|> for Qwen Instruct) itself."""
 
@@ -80,7 +107,7 @@ def build_formatter(P, args):
         if local.random() < args.context_dropout:
             os_name = ""
         return {
-            "prompt": render_prompt(P, row["nl"], shell, os_name, not args.no_few_shots),
+            "prompt": render_prompt(row["nl"], shell, os_name, not args.no_few_shots),
             "completion": row["bash"],
         }
 
@@ -103,7 +130,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", default="Qwen/Qwen2.5-Coder-0.5B-Instruct",
                    help="model id or local path (default: %(default)s)")
     p.add_argument("--do-repo", type=Path, default=DEFAULT_DO_REPO,
-                   help="checkout of the Do project to import the prompt from")
+                   help="Do checkout to check the vendored prompt against, if present")
+    p.add_argument("--allow-prompt-drift", action="store_true",
+                   help="warn instead of exiting when the vendored prompt is stale")
     p.add_argument("--data-dir", type=Path, default=REPO_ROOT / "data" / "example")
     p.add_argument("--output-dir", type=Path, default=REPO_ROOT / "runs" / "do-sft")
     # --- prompt ---
@@ -148,8 +177,8 @@ def resolve_optim(choice: str, model_id: str) -> str:
 def main() -> None:
     args = parse_args()
     optim = resolve_optim(args.optim, args.model)
-    P = load_do_prompt(args.do_repo)
-    formatter = build_formatter(P, args)
+    drift = check_prompt_drift(args.do_repo, args.allow_prompt_drift)
+    formatter = build_formatter(args)
 
     train_dataset = load_split(args.data_dir, "train", formatter)
     # NOTE: this is the InterCode-ALFA test set. Eval loss here is a smoke signal
@@ -157,7 +186,8 @@ def main() -> None:
     # and selecting checkpoints on this split would contaminate that benchmark.
     eval_dataset = load_split(args.data_dir, "test", formatter)
 
-    print(f"model={args.model} optim={optim} prompt_version={P.PROMPT_VERSION} "
+    print(f"model={args.model} optim={optim} "
+          f"prompt_version={P.PROMPT_VERSION} ({drift}) "
           f"few_shots={not args.no_few_shots} "
           f"train={len(train_dataset)} eval={len(eval_dataset)}")
     print("--- example prompt ---")
@@ -208,6 +238,7 @@ def main() -> None:
     # A checkpoint is only valid for the prompt it was trained against.
     (final / "do_prompt.json").write_text(json.dumps({
         "prompt_version": P.PROMPT_VERSION,
+        "prompt_sha256": hashlib.sha256(VENDORED_PROMPT.read_bytes()).hexdigest(),
         "few_shots": not args.no_few_shots,
         "shell": args.shell,
         "os_name": args.os_name,
