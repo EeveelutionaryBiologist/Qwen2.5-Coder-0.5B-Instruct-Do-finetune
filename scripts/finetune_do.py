@@ -150,9 +150,12 @@ def parse_args() -> argparse.Namespace:
     # 15 x 5 = the legacy effective batch of 75.
     p.add_argument("--batch-size", type=int, default=15)
     p.add_argument("--grad-accum", type=int, default=5)
-    # Do's prompt is ~400 tokens with few-shots, so the legacy cap of 150 would
-    # truncate the answer off the end (TRL truncates keep_start).
-    p.add_argument("--max-length", type=int, default=512)
+    # Measured against the real tokenizer: the few-shot scaffold is 335 tokens,
+    # totals run p50 363 / p99 424 / max 731. The legacy cap of 150 would cut the
+    # answer off entirely (TRL truncates keep_start); 512 still silently drops the
+    # completion on 18 rows, 768 on none. With dynamic padding the cap only bounds
+    # truncation -- batch width follows the longest row -- so the headroom is free.
+    p.add_argument("--max-length", type=int, default=768)
     # Fix 2: dynamic padding is the default. Packing is faster still, but its
     # bfd strategy turns on padding-free, which needs FlashAttention 2/3 --
     # so it stays opt-in rather than surprising you on a fresh box.
@@ -164,6 +167,12 @@ def parse_args() -> argparse.Namespace:
                    help="off by default: at these lengths activations are not the bottleneck")
     p.add_argument("--seed", type=int, default=123)
     p.add_argument("--report-to", default="none", help='e.g. "wandb"')
+    # Pre-flight: both let you shake out prompt/tokenizer/VRAM problems in seconds
+    # instead of discovering them an hour into a real run.
+    p.add_argument("--dry-run", action="store_true",
+                   help="build the datasets, print stats, and exit without training")
+    p.add_argument("--max-steps", type=int, default=-1,
+                   help="stop after N optimizer steps (-1 = full run); use a few for a smoke test")
     return p.parse_args()
 
 
@@ -194,6 +203,10 @@ def main() -> None:
     print(train_dataset[0]["prompt"][-220:])
     print(f"--- completion: {train_dataset[0]['completion']!r}")
 
+    if args.dry_run:
+        print("dry run: datasets built, stopping before training.")
+        return
+
     training_args = SFTConfig(
         output_dir=str(args.output_dir),
         # --- data ---
@@ -206,6 +219,7 @@ def main() -> None:
         completion_only_loss=True,
         # --- optimization ---
         num_train_epochs=args.epochs,
+        max_steps=args.max_steps,
         learning_rate=args.lr,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
