@@ -72,11 +72,22 @@ they are actively pruning old APIs.
 
 ## 3. Prompt — mirror Do exactly
 
-Import `SYSTEM`, `FEW_SHOTS` and `build()` from [../Do/do/prompt.py](../Do/do/prompt.py)
-at data-build time. **Do not copy-paste** — rule 4 already changed once (made
-shell-conditional), and a stale copy silently invalidates every rendered example. Stamp
-`PROMPT_VERSION` into the run config and model card; a prompt change invalidates the
-fine-tune.
+Do's prompt module is **vendored** at
+[scripts/vendor/do_prompt.py](scripts/vendor/do_prompt.py) as a byte-identical copy, because
+the Do checkout is not guaranteed to exist on the training machine. Importing it across
+repos would be cleaner but cannot be relied on there.
+
+The risk vendoring introduces is staleness — rule 4 already changed once (made
+shell-conditional), and a stale copy silently invalidates every rendered example. Two
+guards, since a copy can no longer be correct by construction:
+
+- `finetune_do.py` hashes the vendored file against the Do checkout whenever one is
+  reachable and **refuses to train** on a mismatch (`--allow-prompt-drift` to override).
+  On the training machine, with no checkout, it proceeds unchecked — that is the trade.
+- Provenance (upstream commit, sha256, `PROMPT_VERSION`) is recorded in
+  [scripts/vendor/PROVENANCE.md](scripts/vendor/PROVENANCE.md), and `PROMPT_VERSION` plus the
+  file hash are written next to every checkpoint as `do_prompt.json`. A checkpoint is only
+  valid for the prompt it was trained against.
 
 > **Trap:** use TRL's `{"prompt", "completion"}` dataset format, **not**
 > `assistant_only_loss=True`. Do's prompt carries 8 few-shot assistant turns; assistant-only
@@ -99,7 +110,7 @@ Measured over `data/example` (NL2SH-ALFA):
 | Chains with `;` vs `&&` | 1,370 (3.37%) vs 75 (0.18%) — **18:1 against Do's rule 5** |
 | Parses identically under bash **and** zsh | 99.8% (1,500 sampled, 0 zsh-only failures) |
 | Contains any fish-divergent construct | 3.51% — backticks alone are 2.47 pts of that |
-| Genuine structural divergence | ~1% (`VAR=x cmd` 1.07%, `do/done` 0.07%, `then/fi` 0.03%) |
+| Genuine structural divergence | **0.92%** — bare `VAR=x` 0.82%, `do/done` 0.07%, `then/fi` 0.03% |
 | Test `nl` also appearing in train | 3 (1.0%) — dedupe |
 | Duplicate `nl` within train | 729 distinct / 2,480 rows — dedupe before labeling |
 
@@ -118,6 +129,19 @@ Two conclusions:
 parses; `bash -n` / `fish -n` catch almost nothing. A syntactically perfect `ls -la` for
 "list files sorted by size" sails through.
 
+**Three taxonomy corrections, measured in the sandbox — each shrinks the fish surface:**
+
+- **`export VAR=val` is valid fish.** fish ships a compatibility function at
+  `/usr/share/fish/functions/export.fish`. It was in the divergence taxonomy; it does not
+  belong there.
+- **`VAR=x command` is valid fish** (prefix override, since fish 3.1) and behaves
+  identically — verified, not assumed. Only a *bare* `VAR=x`, or `VAR=x; ...`, is rejected.
+  That splits the 1.07% "leading assignment" bucket into 104 valid rows and 332 invalid
+  ones, dropping true structural divergence to 0.82%.
+- **Backticks are not a syntax error in fish.** They parse cleanly and silently yield the
+  literal text instead of a substitution — tier iii, not tier i, so no syntax check will
+  ever flag them. They are the single largest fish-divergent construct at 2.47%.
+
 ### The pipeline
 
 Keep ALFA's human-authored instructions, discard its gold as a *target*, reuse it as an
@@ -126,14 +150,18 @@ Keep ALFA's human-authored instructions, discard its gold as a *target*, reuse i
 1. **Teacher proposes.** `Qwen2.5-Coder-7B-Instruct` generates *n* candidates per
    instruction under Do's exact prompt and GBNF grammar. Policy-conformant by construction,
    since the teacher is obeying the same system prompt Do ships.
-2. **Execution arbitrates.** Run candidate and ALFA gold in a sandbox; keep the candidate
-   only when outputs match. The teacher is a *proposal distribution*, not an authority —
+2. **Execution arbitrates.** Run candidate and ALFA gold in the sandbox
+   ([scripts/shellrun.py](scripts/shellrun.py)); keep the candidate only when
+   `compare()` returns `MATCH`. The teacher is a *proposal distribution*, not an authority —
    best-of-*n* with a verifier comfortably exceeds greedy teacher accuracy, so the student
-   is not capped at the teacher's ceiling.
+   is not capped at the teacher's ceiling. For syntax screening use
+   `check_syntax`, never a raw `fish -n`: **fish 3.6 exits 0 on syntax errors**, so only
+   stderr detects them.
 3. **Shell labeling.** Three-tier classification: (i) structurally impossible in fish → must
    translate; (ii) provably identical across shells → agnostic; (iii) parses everywhere but
-   *behaves* differently (unquoted `$var` word splitting, `**` recursion, glob-no-match —
-   bash passes the literal, fish errors). Tier iii needs execution, not regex.
+   *behaves* differently (backticks — the biggest one at 2.47%, unquoted `$var` word
+   splitting, `**` recursion, glob-no-match). Tier iii needs execution, not regex: these
+   parse cleanly in fish and quietly do the wrong thing.
    - **Agnostic majority (ii):** assign bash/zsh/fish uniformly at random, **one label per
      row**. Stops "fish" becoming a rare token correlated with odd output. Do *not* emit
      three copies of `ls -a` — that triples compute and reinforces label-ignoring.
@@ -161,10 +189,18 @@ best-of-*n* is out of reach. Import Do's `prompt.py` and apply the same GBNF und
 same distribution, batched, 50k×8 in well under an hour on the 4090. Use Do's daemon on a
 few hundred samples to *prove* prompt equivalence, then generate in bulk.
 
-### Known caveat
+### Known caveats
 
-The oracle is imperfect: ALFA gold is unverified, so a mismatch is not proof the candidate
-is wrong. Track the reject pile rather than discarding it silently — a low-yield instruction
+**The oracle can only adjudicate about two thirds of the corpus.** 35.3% of rows call a
+primary program the sandbox does not have — `aws`, `tldr`, `az`, `gcloud`, `kubectl` and a
+long tail of **2,699 distinct** tools, of which the top ten cover only 9%. Installing them
+is not an option. Those rows return `NO_VERDICT`, not a match, so the pipeline must decide
+explicitly what happens to them: drop them (losing a third of the data, skewed toward exotic
+tooling), fall back to an LLM judge, or keep the unverified gold. Whichever is chosen, note
+that execution verification silently *cannot* reach them.
+
+The oracle is also imperfect where it does apply: ALFA gold is unverified, so a mismatch is
+not proof the candidate is wrong. Track the reject pile rather than discarding it silently — a low-yield instruction
 is usually either a hard case or a bad gold. Consider an LLM-judge as secondary arbiter on
 mismatches, and decide explicitly whether unresolved instructions are dropped or fall back
 to verified gold.
@@ -190,8 +226,14 @@ to verified gold.
 
 ## 6. Prerequisites
 
-- **fish is not installed here** (bash and zsh are). §4 and §5 need a container with all
-  three shells. Blocking.
+- **Sandbox — built.** [sandbox/](sandbox/) defines a Debian image with bash, zsh and fish
+  plus the corpus's common tooling, and [scripts/shellrun.py](scripts/shellrun.py) executes
+  commands in it and compares results (`Verdict.MATCH` / `DIFFER` / `NO_VERDICT`). Each
+  command gets a fresh copy of a fixed seed tree, so mutating commands cannot contaminate
+  the next one. Not yet built as an image: the Docker daemon is not running on this machine
+  (`sudo systemctl enable --now docker`, then add yourself to the `docker` group).
+- **Still to build:** the three-tier classifier (§4 step 3) and the eval harness (§5), both
+  on top of `shellrun`.
 - **Free win:** Do's grammar is ``first ::= [^`\n\r]`` / `rest ::= [^\n\r]`, so it only bans
   a *leading* backtick. Extending `rest` to ban backticks outright removes 2.47% of fish
   breakage at zero training cost — fish has no backtick substitution, and `$(...)` is correct
