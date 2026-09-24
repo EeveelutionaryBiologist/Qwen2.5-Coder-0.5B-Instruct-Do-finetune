@@ -2,3 +2,12 @@
 # Model files
 model/
 
+# Datasets (downloaded and generated)
+data/
+
+
+# Python bytecode
+__pycache__/
+
+# Training runs (checkpoints)
+runs/
