@@ -11,6 +11,10 @@ them against an identical filesystem produces the same output and exit status.
 The corpus is unverified and contains destructive commands. DockerRunner is the
 only backend that is safe for it; LocalRunner exists for developing on bash/zsh
 and refuses to start unless you say you meant it.
+
+Measured quirk, fish 3.6: a syntax error exits **0**, with `-n` and on execution
+alike, so exit codes cannot detect invalid fish. Only stderr does. bash and zsh
+exit nonzero as expected. `check_syntax` therefore keys on stderr for all three.
 """
 
 from __future__ import annotations
@@ -30,6 +34,12 @@ DEFAULT_IMAGE = "do-sandbox"
 
 # Every shell here reports "command not found" as 127.
 NOT_FOUND = 127
+
+# Parse without executing. No seed copy: nothing touches the filesystem.
+_SYNTAX_SCRIPT = r"""
+set -u
+"$DO_SHELL" -n -c "$DO_CMD"
+"""
 
 # Run the command in a throwaway copy of the seed tree. The command itself
 # arrives in $DO_CMD so it never has to survive another round of shell quoting.
@@ -73,6 +83,17 @@ class Result:
     def __str__(self) -> str:
         tag = "timeout" if self.timed_out else f"rc={self.returncode}"
         return f"[{self.shell} {tag}] {self.stdout.strip()[:200]}"
+
+
+@dataclass(frozen=True)
+class SyntaxResult:
+    shell: str
+    command: str
+    ok: bool
+    message: str = ""
+
+    def __bool__(self) -> bool:
+        return self.ok
 
 
 class Verdict(Enum):
@@ -136,9 +157,9 @@ class LocalRunner:
     def close(self) -> None:
         shutil.rmtree(self._seed, ignore_errors=True)
 
-    def __call__(self, shell: str, command: str) -> Result:
+    def _spawn(self, shell: str, command: str, script: str):
         if not shutil.which(shell):
-            return Result(shell, command, NOT_FOUND, "", f"{shell}: not installed")
+            return None
         env = {
             **os.environ,
             "DO_CMD": command,
@@ -147,14 +168,33 @@ class LocalRunner:
             "DO_TIMEOUT": str(self.timeout),
         }
         try:
-            proc = subprocess.run(
-                ["sh", "-c", _SCRIPT], env=env, capture_output=True,
-                text=True, timeout=self.timeout + 5,
-            )
+            return subprocess.run(["sh", "-c", script], env=env, capture_output=True,
+                                  text=True, timeout=self.timeout + 5)
         except subprocess.TimeoutExpired:
-            return Result(shell, command, 124, "", "", timed_out=True)
+            return None
+
+    def __call__(self, shell: str, command: str) -> Result:
+        proc = self._spawn(shell, command, _SCRIPT)
+        if proc is None:
+            return Result(shell, command, 124, "", f"{shell}: unavailable or timed out",
+                          timed_out=True)
         return Result(shell, command, proc.returncode, proc.stdout, proc.stderr,
                       timed_out=proc.returncode == 124)
+
+    def check_syntax(self, shell: str, command: str) -> SyntaxResult:
+        """Does this command parse as `shell`?
+
+        Keyed on stderr, not the exit code: fish 3.6 reports syntax errors with
+        status 0. Note this catches only *parse* errors -- fish accepts
+        backticks silently and simply produces the wrong output, which is a
+        behavioural difference no syntax check can see.
+        """
+        proc = self._spawn(shell, command, _SYNTAX_SCRIPT)
+        if proc is None:
+            return SyntaxResult(shell, command, False, f"{shell}: not available")
+        message = proc.stderr.strip()
+        return SyntaxResult(shell, command, not message, message)
+
 
 
 class DockerRunner:
@@ -186,19 +226,39 @@ class DockerRunner:
         subprocess.run(["docker", "kill", self.name],
                        capture_output=True, check=False)
 
-    def __call__(self, shell: str, command: str) -> Result:
+    def _spawn(self, shell: str, command: str, script: str):
         try:
-            proc = subprocess.run(
+            return subprocess.run(
                 ["docker", "exec",
                  "-e", f"DO_CMD={command}", "-e", f"DO_SHELL={shell}",
                  "-e", "DO_SEED=/opt/seed", "-e", f"DO_TIMEOUT={self.timeout}",
-                 self.name, "sh", "-c", _SCRIPT],
+                 self.name, "sh", "-c", script],
                 capture_output=True, text=True, timeout=self.timeout + 15,
             )
         except subprocess.TimeoutExpired:
+            return None
+
+    def __call__(self, shell: str, command: str) -> Result:
+        proc = self._spawn(shell, command, _SCRIPT)
+        if proc is None:
             return Result(shell, command, 124, "", "", timed_out=True)
         return Result(shell, command, proc.returncode, proc.stdout, proc.stderr,
                       timed_out=proc.returncode == 124)
+
+    def check_syntax(self, shell: str, command: str) -> SyntaxResult:
+        """Does this command parse as `shell`?
+
+        Keyed on stderr, not the exit code: fish 3.6 reports syntax errors with
+        status 0. Note this catches only *parse* errors -- fish accepts
+        backticks silently and simply produces the wrong output, which is a
+        behavioural difference no syntax check can see.
+        """
+        proc = self._spawn(shell, command, _SYNTAX_SCRIPT)
+        if proc is None:
+            return SyntaxResult(shell, command, False, f"{shell}: not available")
+        message = proc.stderr.strip()
+        return SyntaxResult(shell, command, not message, message)
+
 
 
 if __name__ == "__main__":
